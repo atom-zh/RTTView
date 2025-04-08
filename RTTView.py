@@ -73,11 +73,12 @@ class RTTView(QWidget):
         self.elffile = None
         
         self.tmrRTT = QtCore.QTimer()
-        self.tmrRTT.setInterval(10)
+        self.tmrRTT.setInterval(2)
         self.tmrRTT.timeout.connect(self.on_tmrRTT_timeout)
         self.tmrRTT.start()
 
         self.tmrRTT_Cnt = 0
+        self.reconnect_flg = 0
     
     def initSetting(self):
         if not os.path.exists('setting.ini'):
@@ -224,7 +225,89 @@ class RTTView(QWidget):
             self.btnDLL.setEnabled(True)
             self.cmbAddr.setEnabled(True)
             self.btnOpen.setText('打开连接')
-    
+
+    def reconnect(self):
+        if self.reconnect_flg == 1:
+            self.xlk.close()
+            self.cmbDLL.setEnabled(True)
+            self.btnDLL.setEnabled(True)
+            self.cmbAddr.setEnabled(True)
+            try:
+                if self.cmbDLL.currentIndex() == 0:
+                    self.xlk = xlink.XLink(jlink.JLink(self.cmbDLL.currentText(), 'Cortex-M0'))
+
+                else:
+                    from pyocd.coresight import dap, ap, cortex_m
+                    daplink = self.daplinks[self.cmbDLL.currentIndex() - 1]
+                    daplink.open()
+
+                    _dp = dap.DebugPort(daplink, None)
+                    _dp.init()
+                    _dp.power_up_debug()
+
+                    _ap = ap.AHB_AP(_dp, 0)
+                    _ap.init()
+
+                    self.xlk = xlink.XLink(cortex_m.CortexM(None, _ap))
+
+                if self.chkSave.isChecked():
+                    self.rcvfile = open(datetime.datetime.now().strftime("rcv_%y%m%d%H%M%S.txt"), 'w')
+
+                if re.match(r'0[xX][0-9a-fA-F]{8}', self.cmbAddr.currentText()):
+                    addr = int(self.cmbAddr.currentText(), 16)
+                    for i in range(256):
+                        data = self.xlk.read_mem_U8(addr + 1024 * i, 1024 + 32)  # 多读32字节，防止搜索内容在边界处
+                        index = bytes(data).find(b'SEGGER RTT')
+                        if index != -1:
+                            self.RTTAddr = addr + 1024 * i + index
+
+                            data = self.xlk.read_mem_U8(self.RTTAddr, ctypes.sizeof(SEGGER_RTT_CB))
+
+                            rtt_cb = SEGGER_RTT_CB.from_buffer(bytearray(data))
+                            self.aUpAddr = self.RTTAddr + 16 + 4 + 4
+                            self.aDownAddr = self.aUpAddr + ctypes.sizeof(RingBuffer) * rtt_cb.MaxNumUpBuffers
+
+                            self.txtMain.append(
+                                f'\n_SEGGER_RTT @ 0x{self.RTTAddr:08X} with {rtt_cb.MaxNumUpBuffers} aUp and {rtt_cb.MaxNumDownBuffers} aDown\n')
+                            self.reconnect_flg = 0
+                            break
+
+                    else:
+                        raise Exception('Can not find _SEGGER_RTT')
+
+                    self.rtt_cb = True
+
+                else:
+                    self.rtt_cb = False
+
+            except Exception as e:
+                self.txtMain.append(f'\nerror: {str(e)}\n')
+
+                try:
+                    self.xlk.close()
+                except:
+                    try:
+                        daplink.close()
+                    except:
+                        pass
+
+            else:
+                self.cmbDLL.setEnabled(False)
+                self.btnDLL.setEnabled(False)
+                self.cmbAddr.setEnabled(False)
+                self.btnOpen.setText('关闭连接')
+
+        else:
+            if self.rcvfile and not self.rcvfile.closed:
+                self.rcvfile.close()
+
+            self.xlk.close()
+
+            self.cmbDLL.setEnabled(True)
+            self.btnDLL.setEnabled(True)
+            self.cmbAddr.setEnabled(True)
+            self.btnOpen.setText('打开连接')
+
     def aUpRead(self):
         data = self.xlk.read_mem_U8(self.aUpAddr, ctypes.sizeof(RingBuffer))
 
@@ -274,6 +357,19 @@ class RTTView(QWidget):
     def on_tmrRTT_timeout(self):
         self.tmrRTT_Cnt += 1
         if self.btnOpen.text() == '关闭连接':
+            if self.reconnect_flg == 1:
+                if self.tmrRTT_Cnt % 1000 == 1:
+                    print("reconnect")
+                    self.reconnect()
+                return
+
+            if self.tmrRTT_Cnt % 1000 == 1:
+                reg_pc = self.xlk.read_mem_U32(0xE00FFFE8, 1)[0]
+                print(hex(reg_pc))
+                if reg_pc == 0xAAAAAAAA:
+                    self.reconnect_flg = 1
+                    return
+
             try:
                 if self.rtt_cb:
                     rcvdbytes = self.aUpRead()
@@ -291,6 +387,7 @@ class RTTView(QWidget):
                 rcvdbytes = b''
 
             if rcvdbytes:
+                rcvdbytes = f'{datetime.datetime.now()}: '.encode() + rcvdbytes
                 if self.rcvfile and not self.rcvfile.closed:
                     self.rcvfile.write(rcvdbytes.decode('latin-1'))
 
@@ -390,7 +487,7 @@ class RTTView(QWidget):
 
                             else:
                                 break
-                    
+
                     if len(self.txtMain.toPlainText()) > 25000: self.txtMain.clear()
                     self.txtMain.moveCursor(QtGui.QTextCursor.End)
                     self.txtMain.insertPlainText(text)
